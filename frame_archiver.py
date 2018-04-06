@@ -2,12 +2,16 @@
 
 import os
 import sys
+import time
 import pwd
 import pathlib
-import smtplib
+import email
+import collections
+from smtplib import SMTP
+import subprocess
 import logging
-#import bagit
 
+import bagit
 
 
 TAPEDEVICE = "/dev/tape/by-id/scsi-3500507631211505c-nst"
@@ -18,12 +22,29 @@ MAILADDRESS = ""
 
 
 
-class FrameDataset:
-    def __init__(self, path):
-        self.path = path
-        self.uid = 0
-        self.gid = 0
-        self.tapes = []
+#class FrameDataset:
+#    def __init__(self, path):
+#        self.path = path
+#        self.uid = 0
+#        self.gid = 0
+#        self.tapes = []
+
+Testdata = collections.namedtuple('FrameDataset',
+                                  ['path', 'username', 'uid', 'gid',
+                                   'bagged', 'tapes'])
+
+class Error(Exception):
+    """Base class for exceptions in this module."""
+    pass
+
+
+class TapeError(Error):
+    """Errors regarding tape drive or autoloader"""
+    def __init__(self, message):
+#        super().__init__(message)
+        #self.expression = expression
+        self.message = message
+
 
 def adjust_dir_permissions(path):
     '''change user and permissions according to username in dir name'''
@@ -54,15 +75,16 @@ def yes_or_no(question):
 #    else:
 #        return yes_or_no("please enter y or n")
 
+
 def mail_message(message):
-    
-    email.message_from_string(message)
-    msg['Subject'] = 'testmail with python'
+    """mail error messages to admin"""
+    msg = email.message_from_string(message)
+    msg['Subject'] = 'frame archiver: '
     msg['From'] = 'python@ema3013'
     msg['To'] = MAILADDRESS
-    s = smtplib.SMTP('localhost')
-    s.send_message(msg)
-    s.quit()
+    server = SMTP('localhost')
+    server.sendmail("From: ", "To: ", message)
+    server.quit()
 
 
 def script_fail(errormsg="unknown error"):
@@ -70,19 +92,20 @@ def script_fail(errormsg="unknown error"):
     print("script failed with error:", errormsg)
 
 
-def lock_directory():
+def lock_directory(path):
     #TODO
     pass
 
 
-def unlock_directory():
+def unlock_directory(path):
     #TODO
     pass
 
-def get_tape_label():
+
+def get_tape_label(changer=CHANGERDEVICE):
     """read label of tape in drive"""
     tapelabel = "ERROR"
-    output = subprocess.check_output(["mtx", "-f", CHANGERDEVICE, "status"])
+    output = subprocess.check_output(["mtx", "-f", changer, "status"])
     line = output.splitlines()[1]
 
     #print("type of output:",type(output))
@@ -114,7 +137,7 @@ def format_tape(tape, ask_to_confirm=True):
     command = "mkltfs"
     format_rules = "size=500K/name=indexfile.txt"
     print(format_rules)
-    #TODO: confirm formatting
+    #confirm formatting
     loaded_tape = get_tape_label()
     if ask_to_confirm is True:
         confirm = yes_or_no("FORMAT tape labeled " + loaded_tape + " to LTFS, serial " + tape + "?")
@@ -125,10 +148,13 @@ def format_tape(tape, ask_to_confirm=True):
             print("formatting cancelled by user")
             script_fail(errormsg="formatting cancelled")
     else:
-        result = subprocess.check_call([command_path+command, "-d",
-                                        TAPEDEVICE, "-r", format_rules, "-s", tape, "-n", tape])
+        try:
+            result = subprocess.check_call([command_path+command, "-d",
+                                            TAPEDEVICE, "-r", format_rules, "-s", tape, "-n", tape])
+        except subprocess.CalledProcessError:
+            raise TapeError('Error formatting tape')
     print(result)
-    return result 
+    return result
 
 
 def mount_tape(mountpoint):
@@ -136,58 +162,93 @@ def mount_tape(mountpoint):
     result = False
     command_path = "/opt/QUANTUM/ltfs/bin/"
     command = "ltfs-singledrive" + ' -o devname=' + TAPEDEVICE + ' ' + mountpoint
-    #TODO: check if mountpoint exits
-    #TODO: check if mountpoint is not already mounted
-
-    result = subprocess.check_call(command_path+command, shell=True)
-    #TODO: check if mountpoint is mounted
-    return mountpoint
-
-
-
-
-
-
-
-#logger = logging.Logger()
-logging.basicConfig(level=logging.DEBUG)
-
-logging.info("starting ...")
-
-frame_dir = pathlib.PosixPath("./TEST-IGNORE").resolve()
-archive_dir = pathlib.PosixPath("./TEST-IGNORE/ARCHIVE").resolve()
-
-
-#sanity checks
-
-#if not os.path.ismount(frame_dir):
-#   logging.debug("framedir not mounted: %s", frame_dir)
-#   sys.exit()
-
-logging.debug("using %s", frame_dir)
-os.chdir(frame_dir)
-
-dirs = []
-for d in os.listdir(frame_dir):
-    if os.path.isdir(d) and not os.path.islink(d):
-        dirs.append(pathlib.PosixPath(d))
-print(dirs)
-
-dir_names = []
-
-for d in dirs:
-#starts with 20
-    if ( d.name == "ARCHIVE"): continue
-    elif ( d.name[:2] == "20" and
-         d.name[4] == "-" and
-         d.name[10] == "-"):
-        dir_names.append(d)
+    #check if mountpoint exits
+    if not mountpoint.is_dir():
+        raise TapeError('Mount directory not found')
+    #check if mountpoint is not already mounted
+    if os.path.ismount(mountpoint):
+        raise TapeError('Mount directory already mounted ?')
+    try:
+        result = subprocess.check_call(command_path+command, shell=True)
+    except subprocess.CalledProcessError:
+        raise TapeError('Error mounting tape')
+    #result.c
+    #check if mountpoint is mounted
+    if os.path.ismount(mountpoint):
+        return mountpoint
     else:
-        logging.warn("found malformed directory name:%s", d)
-print(dir_names)
+        raise TapeError('Error while mounting tape')
 
 
-for path in dir_names:
-    adjust_dir_permissions(path)
+def unmount_tape(mountpoint):
+    if not os.path.ismount(mountpoint):
+        raise TapeError('Mount directory not mounted ?')
+        command = "umount " + mountpoint
+        try:
+            result = subprocess.check_call(command, shell=True)
+        except subprocess.CalledProcessError:
+            raise TapeError('Error mounting tape')
 
-#test if metadata file is present:
+
+def create_bag(dataset):
+    info = {'Authors': dataset.username}
+    bag = bagit.make_bag(dataset.path, info)
+    bag.save(manifests=True)
+    dataset.bagged = True
+
+def split_bag(bag):
+    pass
+
+
+def copy_to_tape(dataset):
+    pass
+
+
+def validate_tape(path):
+    pass
+
+
+
+if __name__ == "__main__":
+
+    #logger = logging.Logger()
+    logging.basicConfig(level=logging.DEBUG)
+
+    logging.info("starting ...")
+
+    FRAME_DIR = pathlib.PosixPath("./TEST-IGNORE").resolve()
+    ARCHIVE_DIR = pathlib.PosixPath("./TEST-IGNORE/ARCHIVE").resolve()
+
+    #sanity checks
+    #if not os.path.ismount(FRAME_DIR):
+    #   logging.debug("framedir not mounted: %s", FRAME_DIR)
+    #   sys.exit()
+
+    logging.debug("using %s", FRAME_DIR)
+    os.chdir(FRAME_DIR)
+
+    dirs = []
+    for d in os.listdir(FRAME_DIR):
+        if os.path.isdir(d) and not os.path.islink(d):
+            dirs.append(pathlib.PosixPath(d))
+    print(dirs)
+
+    dir_names = []
+
+    for d in dirs:
+        #starts with 20
+        if d.name == "ARCHIVE":
+            continue
+        elif ( d.name[:2] == "20" and
+               d.name[4] == "-" and
+               d.name[10] == "-"):
+            dir_names.append(d)
+        else:
+            logging.warn("found malformed directory name:%s", d)
+    print(dir_names)
+
+    for path in dir_names:
+        adjust_dir_permissions(path)
+
+    #test if metadata file is present:
+    
