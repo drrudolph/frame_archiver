@@ -1,8 +1,11 @@
-#!/usr/bin/python36
+#!/usr/bin/python36/
+# 2018 Daniel R. Rudolph for EMA group at research center caesar, Bonn
+
 
 import os
 import sys
 import time
+import datetime
 import pwd
 import pathlib
 import email
@@ -10,15 +13,18 @@ import collections
 from smtplib import SMTP
 import subprocess
 import logging
+from configobj import ConfigObj
+import inotify
 
 import bagit
+from daemonize import Daemonize
 
 
-TAPEDEVICE = "/dev/tape/by-id/scsi-3500507631211505c-nst"
-CHANGERDEVICE = "/dev/tape/by-id/scsi-3500e09efff107510"
-LTFSMOUNTPOINT = "/mnt/ltfs-archive/"
-INDEXFILESDIR = "/root/TAPES/"
-MAILADDRESS = ""
+#TAPEDEVICE = "/dev/tape/by-id/scsi-3500507631211505c-nst"
+#CHANGERDEVICE = "/dev/tape/by-id/scsi-3500e09efff107510"
+#LTFSMOUNTPOINT = "/mnt/ltfs-archive/"
+#INDEXFILESDIR = "/root/TAPES/"
+#MAILADDRESS = ""
 
 
 
@@ -102,7 +108,7 @@ def unlock_directory(path):
     pass
 
 
-def get_tape_label(changer=CHANGERDEVICE):
+def get_tape_label(changer):
     """read label of tape in drive"""
     tapelabel = "ERROR"
     output = subprocess.check_output(["mtx", "-f", changer, "status"])
@@ -128,7 +134,7 @@ def change_tape(slotnum):
     return result
 
 
-def format_tape(tape, ask_to_confirm=True):
+def format_tape(tape, changer, ask_to_confirm=True):
     """format tape in drive with LTFS"""
     #alias mkltfs-loader2='mkltfs --device=/dev/tape/by-id/scsi-3500507631211505c-nst
     # --rules="size=500K/name=indexfile.txt"'
@@ -138,7 +144,7 @@ def format_tape(tape, ask_to_confirm=True):
     format_rules = "size=500K/name=indexfile.txt"
     print(format_rules)
     #confirm formatting
-    loaded_tape = get_tape_label()
+    loaded_tape = get_tape_label(changer)
     if ask_to_confirm is True:
         confirm = yes_or_no("FORMAT tape labeled " + loaded_tape + " to LTFS, serial " + tape + "?")
         if confirm is True:
@@ -207,25 +213,20 @@ def copy_to_tape(dataset):
 def validate_tape(path):
     pass
 
+def archiver():
 
-
-if __name__ == "__main__":
-
-    #logger = logging.Logger()
-    logging.basicConfig(level=logging.DEBUG)
-
-    logging.info("starting ...")
-
-    FRAME_DIR = pathlib.PosixPath("./TEST-IGNORE").resolve()
-    ARCHIVE_DIR = pathlib.PosixPath("./TEST-IGNORE/ARCHIVE").resolve()
+    logger.debug("Starting Archiver")
 
     #sanity checks
     #if not os.path.ismount(FRAME_DIR):
     #   logging.debug("framedir not mounted: %s", FRAME_DIR)
     #   sys.exit()
 
-    logging.debug("using %s", FRAME_DIR)
+    logging.debug("using %s as frame directory", FRAME_DIR)
     os.chdir(FRAME_DIR)
+
+
+    logging.debug(datetime.datetime.now().isoformat())
 
     dirs = []
     for d in os.listdir(FRAME_DIR):
@@ -239,9 +240,9 @@ if __name__ == "__main__":
         #starts with 20
         if d.name == "ARCHIVE":
             continue
-        elif ( d.name[:2] == "20" and
-               d.name[4] == "-" and
-               d.name[10] == "-"):
+        elif (d.name[:2] == "20" and
+              d.name[4] == "-" and
+              d.name[10] == "-"):
             dir_names.append(d)
         else:
             logging.warn("found malformed directory name:%s", d)
@@ -250,5 +251,58 @@ if __name__ == "__main__":
     for path in dir_names:
         adjust_dir_permissions(path)
 
+    #        logging.debug(datetime.datetime.now().isoformat())
     #test if metadata file is present:
-    
+
+if __name__ == "__main__":
+
+    #logger = logging.getLogger(__name__)
+    logger = logging.Logger(__name__)
+    logging.basicConfig(level=logging.DEBUG)
+    logger.propagate = False
+    fh = logging.FileHandler("/tmp/test.log", "w")
+    fh.setLevel(logging.DEBUG)
+    logger.addHandler(fh)
+    keep_fds = [fh.stream.fileno()]
+    logging.info("starting ...")
+
+    config = ConfigObj('/etc/frame_archiver.conf')
+    #config['DEFAULT'] 
+    #with open('/etc/frame_archiver.conf', 'r') as configfile:
+        #TODO: config file checking
+    #    config.read(configfile)
+    #    archiverconf = config['Archiver']
+    FRAME_DIR = config['framedir']
+    ARCHIVE_DIR = config['archivedir']
+    pid = config['pidfile']
+
+    TAPEDEVICE = config['tapedevice']
+    CHANGERDEVICE = config['changerdevice']
+    LTFSMOUNTPOINT = config['ltfsmountpoint']
+    INDEXFILESDIR = config['indexfilesdir']
+    MAILADDRESS = config['mailaddress']
+    INTERVAL = config.as_int('interval')
+
+
+
+    #TODO: Error checking
+    FRAME_DIR = pathlib.PosixPath(FRAME_DIR).resolve()
+    ARCHIVE_DIR = pathlib.PosixPath(ARCHIVE_DIR).resolve()
+
+    run_as_daemon = False
+    if run_as_daemon == True:
+        
+        daemon = Daemonize(app="frame_archive", pid=pid,
+                           action=archiver, keep_fds=keep_fds, logger=logger,
+                           verbose=True, foreground=True)
+        daemon.start()
+        while True:
+            halt = False
+        while not halt:
+            print("testing")
+            time.sleep(5)
+            time.sleep(INTERVAL)
+
+    else:
+        #run once
+        archiver()
