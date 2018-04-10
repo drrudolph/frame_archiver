@@ -13,10 +13,13 @@ import collections
 from smtplib import SMTP
 import subprocess
 import logging
-from configobj import ConfigObj
-import inotify
+from pathlib import Path
+import shutil
 
 import bagit
+from configobj import ConfigObj
+import inotify.adapters
+from celery import Celery
 from daemonize import Daemonize
 
 
@@ -202,8 +205,129 @@ def create_bag(dataset):
     bag.save(manifests=True)
     dataset.bagged = True
 
-def split_bag(bag):
-    pass
+
+#def process_dir(path, msize, move=False):
+#    """split dir into several dirs with msize (MB), simple splitting,
+#        returns number of chunks"""
+#    msize = msize*1024*1024
+#    #total is small enough
+#    if os.path.getsize(path) < msize:
+#            return 1
+#    else:
+#        #find all subdirs larger than msize
+#        largedirs = []
+#        smalldirs = []
+#        bags = []
+#        current_size = 0
+#        current_bag = []
+#        for subdirs in os.scandir(path):
+#            for entry in subdirs:
+#                if entry.is_dir():
+#                    entrysize = os.path.getsize(entry)
+#                    if entrysize + current_size <= msize:
+#                        current_bag.append(entry)
+#                        current_size += os.path.getsize(entry)
+#                    else: 
+#                        #bag full, new bag
+#                        bags.append(current_bag)
+#                        current_bag = [entry]
+#                        current_size = entrysize
+#
+#                        
+##                    try:
+##                        if os.path.getsize(subdir) > msize:
+##                            largedirs.append(subdir)
+##                        else:
+##                           smalldirs.append(subdir) 
+##                    except:
+##                        pass#TODO
+#
+#            #case: only one directory too large, pack files
+#            if len(largedirs) == 1:
+#                for entry in os.scandir(largedirs[0]):
+#                    #process_dir rekursiv ?
+#            #case: several subdirs, at least one larger than msize
+#            elif len(largedirs) > 1:
+#                
+#            #case: several subdirs, all smaller than msize, pack subdirs
+#            else:
+#                bins = binpacking.to_constant_volume(smalldirs, msize)
+
+def get_dir_size(path):
+    """https://gist.github.com/SteveClement/3755572"""
+    total_size = 0
+    for dirpath, dirnames, filenames in os.walk(path):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            total_size += os.path.getsize(fp)
+    return total_size
+
+
+def split_bag(bag, msize, copy=True, mode='Simple'):
+    """split bag into several bags with max size msize (MB), simple splitting,
+        returns list of bags
+        """
+    #msize = msize*1024*1024
+    #total is small enough
+    if get_dir_size(bag.path) <= msize:
+        bags = [bag]
+    else:
+        if mode == 'Simple':
+            splits = []
+            current_size = 0
+            current_bag = []
+            orig_path = Path(bag.path)
+            
+            for item in list(bag.entries.keys()):
+                itempath = Path(item)
+                itemsize = os.path.getsize(orig_path.joinpath(itempath))
+                #logger.debug(itempath, itemsize)
+                print("itempath, itemsize:", itempath, itemsize)
+
+                if (itemsize + current_size) <= msize:
+                    print("current_size before", current_size)
+                    print("appending ", item)
+                    current_bag.append(itempath)
+                    current_size += itemsize
+                    print("current_size after", current_size)
+
+                    #print("current_bag: ", current_bag)
+                else: 
+                    #bag full, new bag
+                    #print("bag full, current_bag: ", current_bag)
+                    bag_full = True
+                    splits.append(current_bag)
+                    current_bag = [itempath]
+                    current_size = itemsize
+                    
+            #print("end, current_bag: ", current_bag)
+            if not bag_full: splits.append(current_bag)
+        elif mode == 'Packing':
+            raise NotImplementedError
+
+        #TODO: check number of bags
+
+        #copy items to bags
+        print("splits: ",splits)
+        for split in splits:
+            #print("split:", split)
+            for i, file in enumerate(split):
+                print("i: %s file: %s", i, file)
+                suffix = '_' + chr(i+97)
+                #print(suffix)
+                new_bag_path = Path(orig_path.name + suffix)
+                #print(new_bag_path)
+                new_file_path = new_bag_path.joinpath(file.parent)
+                pathlib.Path.mkdir(new_file_path, parents=True, exist_ok=True)
+                #print("src:", orig_path.joinpath(file))
+                #print("dst:", new_bag_path.joinpath(file))
+                shutil.copy2(orig_path.joinpath(file), new_bag_path.joinpath(file))
+
+        bags = splits
+
+    return bags
+
+
 
 
 def copy_to_tape(dataset):
@@ -213,8 +337,23 @@ def copy_to_tape(dataset):
 def validate_tape(path):
     pass
 
-def archiver():
 
+@app.task(name='workers.watch_dir')
+def watch_dir(path):
+    i = inotify.adapters.Inotify(path)
+    #try:
+    for event in i.event_gen():
+        if event is not None:
+            (header, type_names, watch_path, filename) = event
+            logger.info("WD=(%d) MASK=(%d) COOKIE=(%d) LEN=(%d) MASK->NAMES=%s " "WATCH-PATH=[%s] FILENAME=[%s]",
+            header.wd, header.mask, header.cookie, header.len, type_names,
+            watch_path.decode('utf-8'), filename.decode('utf-8'))
+        
+
+
+
+def archiver():
+    
     logger.debug("Starting Archiver")
 
     #sanity checks
@@ -256,6 +395,10 @@ def archiver():
 
 if __name__ == "__main__":
 
+    
+    app = Celery('watch_dir', backend='rpc://', broker='pyamqp://')
+    app.config_from_object('celeryconfig')
+    
     #logger = logging.getLogger(__name__)
     logger = logging.Logger(__name__)
     logging.basicConfig(level=logging.DEBUG)
