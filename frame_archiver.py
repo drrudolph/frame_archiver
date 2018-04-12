@@ -15,6 +15,8 @@ import subprocess
 import logging
 from pathlib import Path
 import shutil
+import io
+import hashlib
 
 import bagit
 from configobj import ConfigObj
@@ -204,6 +206,49 @@ def create_bag(dataset):
     bag = bagit.make_bag(dataset.path, info)
     bag.save(manifests=True)
     dataset.bagged = True
+
+
+class HashTransparentFile():
+    """based on https://stackoverflow.com/questions/14014854/python-on-the-fly-md5-as-one-reads-a-stream"""
+    def __init__(self, source, hashlist):
+        self.hashlist = hashlist
+        self._sigmd5 = hashlib.md5()
+        self._sigsha1 = hashlib.sha1()
+        self._sigsha256 = hashlib.sha256()
+        self._sigsha512 = hashlib.sha512()
+        self._source = source
+
+    def read(self, buffer):
+        # we ignore the buffer size, just use the `.next()` value in the source iterator
+        try:
+            line = self._source.next()
+            
+            #TODO: only calculate requested
+            self._sigmd5.update(line)
+            self._sigsha1.update(line)
+            self._sigsha256.update(line)
+            self._sigsha512.update(line)
+            
+            return line
+        except StopIteration:
+            return b''
+
+    def hexdigest(self):
+        hashes = []
+        if 'md5' in self.hashlist:
+            hashes.append({'md5': self._sigmd5.hexdigest()})
+        if 'sha1' in self.hashlist:
+            hashes.append({'sha1': self._sigsha1.hexdigest()})
+        if 'sha256' in self.hashlist:
+            hashes.append({'sha256': self._sigsha256.hexdigest()})
+        if 'sha512' in self.hashlist:
+            hashes.append({'sha512': self._sigsha512.hexdigest()})
+        return hashes
+
+
+def copy_dataset(dataset, chunksize, hashlist):
+    for file in dataset.list:
+        hashed = HashTransparentFile(file.iter_content(chunksize), hashlist)
 
 
 #def process_dir(path, msize, move=False):
@@ -441,6 +486,7 @@ if __name__ == "__main__":
         daemon.start()
         while True:
             halt = False
+            
         while not halt:
             print("testing")
             time.sleep(5)
