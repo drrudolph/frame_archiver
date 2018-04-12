@@ -28,19 +28,44 @@ class TapeError(Error):
         self.message = message
 
 
-def get_tape_label(changer):
+def get_tape_labels(changer):
     """read label of tape in drive"""
-    tapelabel = "ERROR"
-    output = subprocess.check_output(["mtx", "-f", changer, "status"])
+    try:
+        output = subprocess.check_output(["mtx", "-f", changer, "status"])
+    except:
+        logging.error("error reading mtx status")
+    
+    tapelabels = collections.OrderedDict()
+    #try:
     line = output.splitlines()[1]
+    #logging.debug("type of output:",type(output))
+    #logging.debug(output)
+    logging.debug(line.decode()[-5:])
+    #logging.debug(line.decode().split[3])
+    #drive_label = line.decode().split[3]
+    drive_label = line.decode()[-5:]
+    #logging.debug(":".join("{:02x}".format(ord(c)) for c in drive_label))
+    #logging.debug(type(drive_label))
+    if drive_label.strip() == "Empty":
+        logging.debug("No Tape in Drive")
+        tapelabels['Drive'] = None
+    else:
+        tapelabels['Drive'] = line.decode().split()[9]
+    logging.debug("tapelabels: %s", tapelabels)
+        #except:
+    #        tapelabel = "ERROR"
+    #        logging.error("error decoding tape label")
+    for i, line in enumerate(output.splitlines()[2:18]):
+        if line.decode().strip()[-5:] == "Empty":
+            logging.debug("if branch")
+            tapelabels['Slot'+ str(i+1)] = None
+        else:
+            tapelabels['Slot'+ str(i+1)] = line.decode().strip()[-8:-2]
+            
+    logging.info(tapelabels)
+    return tapelabels
 
-    #print("type of output:",type(output))
-    #print(output)
-    #print(line)
-
-    tapelabel = line.decode().split()[9]
-    #print(tapelabel)
-    return tapelabel
+get_tape_labels(CHANGER)
 
 
 def change_tape(slotnum):
@@ -122,6 +147,10 @@ if __name__ == 'main':
     NUM_DRIVES = 1
     NUM_PRODUCERS = 4
     
+    logger = logging.Logger(__name__)
+    logging.basicConfig(level=logging.DEBUG)
+
+    logger.debug("Starting tape_daemon")    
     config = ConfigObj('/etc/tape_daemon.conf')
 
     TAPEDEVICE = config['tapedevice']
@@ -133,3 +162,5 @@ if __name__ == 'main':
     p = Process(target=consumer_func, args=(consumer_endpoint, 0))
     
     iq.close()
+    test = get_tape_label(CHANGERDEVICE)
+    print(test)
