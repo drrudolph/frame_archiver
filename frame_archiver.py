@@ -1,17 +1,13 @@
 #!/usr/bin/python36/
 # 2018 Daniel R. Rudolph for EMA group at research center caesar, Bonn
 
-
 import os
 import sys
 import time
 import datetime
 import pwd
 import pathlib
-import email
 import collections
-from smtplib import SMTP
-import subprocess
 import logging
 from pathlib import Path
 import shutil
@@ -24,14 +20,7 @@ import inotify.adapters
 from celery import Celery
 from daemonize import Daemonize
 
-
-#TAPEDEVICE = "/dev/tape/by-id/scsi-3500507631211505c-nst"
-#CHANGERDEVICE = "/dev/tape/by-id/scsi-3500e09efff107510"
-#LTFSMOUNTPOINT = "/mnt/ltfs-archive/"
-#INDEXFILESDIR = "/root/TAPES/"
-#MAILADDRESS = ""
-
-
+from util import get_dir_size
 
 #class FrameDataset:
 #    def __init__(self, path):
@@ -44,17 +33,15 @@ Testdata = collections.namedtuple('FrameDataset',
                                   ['path', 'username', 'uid', 'gid',
                                    'bagged', 'tapes'])
 
-class Error(Exception):
-    """Base class for exceptions in this module."""
+
+def lock_directory(path):
+    #TODO
     pass
 
 
-class TapeError(Error):
-    """Errors regarding tape drive or autoloader"""
-    def __init__(self, message):
-#        super().__init__(message)
-        #self.expression = expression
-        self.message = message
+def unlock_directory(path):
+    #TODO
+    pass
 
 
 def adjust_dir_permissions(path):
@@ -74,131 +61,6 @@ def adjust_dir_permissions(path):
             fname = os.path.join(root, file)
             os.chown(fname, uid, gid)
             os.chmod(fname, 0o640)
-
-
-
-def yes_or_no(question):
-    reply = str(input(question+' (y/n): ')).lower().strip()
-    if reply[0] == 'y':
-        return True
-    if reply[0] == 'n':
-        return False
-#    else:
-#        return yes_or_no("please enter y or n")
-
-
-def mail_message(message):
-    """mail error messages to admin"""
-    msg = email.message_from_string(message)
-    msg['Subject'] = 'frame archiver: '
-    msg['From'] = 'python@ema3013'
-    msg['To'] = MAILADDRESS
-    server = SMTP('localhost')
-    server.sendmail("From: ", "To: ", message)
-    server.quit()
-
-
-def script_fail(errormsg="unknown error"):
-    """"""
-    print("script failed with error:", errormsg)
-
-
-def lock_directory(path):
-    #TODO
-    pass
-
-
-def unlock_directory(path):
-    #TODO
-    pass
-
-
-def get_tape_label(changer):
-    """read label of tape in drive"""
-    tapelabel = "ERROR"
-    output = subprocess.check_output(["mtx", "-f", changer, "status"])
-    line = output.splitlines()[1]
-
-    #print("type of output:",type(output))
-    #print(output)
-    #print(line)
-
-    tapelabel = line.decode().split()[9]
-    #print(tapelabel)
-    return tapelabel
-
-
-def change_tape(slotnum):
-    """change tape in drive"""
-    result = subprocess.check_call(["mtx", "-f", CHANGERDEVICE, "load", str(slotnum)])
-    if result:
-        script_fail("tape change failed")
-        return result
-    time.sleep(60)
-    #TODO: test if successful
-    return result
-
-
-def format_tape(tape, changer, ask_to_confirm=True):
-    """format tape in drive with LTFS"""
-    #alias mkltfs-loader2='mkltfs --device=/dev/tape/by-id/scsi-3500507631211505c-nst
-    # --rules="size=500K/name=indexfile.txt"'
-    result = False
-    command_path = "/opt/QUANTUM/ltfs/bin/"
-    command = "mkltfs"
-    format_rules = "size=500K/name=indexfile.txt"
-    print(format_rules)
-    #confirm formatting
-    loaded_tape = get_tape_label(changer)
-    if ask_to_confirm is True:
-        confirm = yes_or_no("FORMAT tape labeled " + loaded_tape + " to LTFS, serial " + tape + "?")
-        if confirm is True:
-            result = subprocess.check_call([command_path+command, "-d",
-                                            TAPEDEVICE, "-r", format_rules, "-s", tape, "-n", tape])
-        else:
-            print("formatting cancelled by user")
-            script_fail(errormsg="formatting cancelled")
-    else:
-        try:
-            result = subprocess.check_call([command_path+command, "-d",
-                                            TAPEDEVICE, "-r", format_rules, "-s", tape, "-n", tape])
-        except subprocess.CalledProcessError:
-            raise TapeError('Error formatting tape')
-    print(result)
-    return result
-
-
-def mount_tape(mountpoint):
-    #alias mountltfs-loader2='/opt/QUANTUM/ltfs/bin/ltfs-singledrive -o devname=/dev/tape/by-id/scsi-3500507631211505c-nst /mnt/ltfs-loader2'
-    result = False
-    command_path = "/opt/QUANTUM/ltfs/bin/"
-    command = "ltfs-singledrive" + ' -o devname=' + TAPEDEVICE + ' ' + mountpoint
-    #check if mountpoint exits
-    if not mountpoint.is_dir():
-        raise TapeError('Mount directory not found')
-    #check if mountpoint is not already mounted
-    if os.path.ismount(mountpoint):
-        raise TapeError('Mount directory already mounted ?')
-    try:
-        result = subprocess.check_call(command_path+command, shell=True)
-    except subprocess.CalledProcessError:
-        raise TapeError('Error mounting tape')
-    #result.c
-    #check if mountpoint is mounted
-    if os.path.ismount(mountpoint):
-        return mountpoint
-    else:
-        raise TapeError('Error while mounting tape')
-
-
-def unmount_tape(mountpoint):
-    if not os.path.ismount(mountpoint):
-        raise TapeError('Mount directory not mounted ?')
-        command = "umount " + mountpoint
-        try:
-            result = subprocess.check_call(command, shell=True)
-        except subprocess.CalledProcessError:
-            raise TapeError('Error mounting tape')
 
 
 def create_bag(dataset):
@@ -298,14 +160,7 @@ def copy_dataset(dataset, chunksize, hashlist):
 #            else:
 #                bins = binpacking.to_constant_volume(smalldirs, msize)
 
-def get_dir_size(path):
-    """https://gist.github.com/SteveClement/3755572"""
-    total_size = 0
-    for dirpath, dirnames, filenames in os.walk(path):
-        for f in filenames:
-            fp = os.path.join(dirpath, f)
-            total_size += os.path.getsize(fp)
-    return total_size
+
 
 
 def split_bag(bag, msize, copy=True, mode='Simple'):
@@ -374,7 +229,6 @@ def split_bag(bag, msize, copy=True, mode='Simple'):
 
 
 
-
 def copy_to_tape(dataset):
     pass
 
@@ -383,7 +237,7 @@ def validate_tape(path):
     pass
 
 
-@app.task(name='workers.watch_dir')
+@Celery.task(name='workers.watch_dir')
 def watch_dir(path):
     i = inotify.adapters.Inotify(path)
     #try:
@@ -393,7 +247,8 @@ def watch_dir(path):
             logger.info("WD=(%d) MASK=(%d) COOKIE=(%d) LEN=(%d) MASK->NAMES=%s " "WATCH-PATH=[%s] FILENAME=[%s]",
             header.wd, header.mask, header.cookie, header.len, type_names,
             watch_path.decode('utf-8'), filename.decode('utf-8'))
-        
+            print(event)
+            #adjust_dir_permissions(event)
 
 
 
@@ -464,9 +319,7 @@ if __name__ == "__main__":
     ARCHIVE_DIR = config['archivedir']
     pid = config['pidfile']
 
-    TAPEDEVICE = config['tapedevice']
-    CHANGERDEVICE = config['changerdevice']
-    LTFSMOUNTPOINT = config['ltfsmountpoint']
+
     INDEXFILESDIR = config['indexfilesdir']
     MAILADDRESS = config['mailaddress']
     INTERVAL = config.as_int('interval')
