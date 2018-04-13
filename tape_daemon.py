@@ -12,10 +12,15 @@ import logging
 import time
 import os
 import subprocess
+import pathlib
+import collections
 
-from multiprocessing import Process
-from iterable_queue import IterableQueue
 from configobj import ConfigObj
+
+from twisted.internet.protocol import Protocol
+from twisted.internet.endpoints import TCP4ServerEndpoint
+from twisted.internet.protocol import Factory
+from twisted.internet import reactor
 
 from util import Error, yes_or_no, script_fail
 
@@ -26,6 +31,7 @@ class TapeError(Error):
 #        super().__init__(message)
         #self.expression = expression
         self.message = message
+        logging.debug(message)
 
 
 def get_tape_labels(changer):
@@ -43,7 +49,7 @@ def get_tape_labels(changer):
     logging.debug(line.decode()[-5:])
     #logging.debug(line.decode().split[3])
     #drive_label = line.decode().split[3]
-    drive_label = line.decode()[-5:]
+    drive_label = line.decode()[-5:-2]
     #logging.debug(":".join("{:02x}".format(ord(c)) for c in drive_label))
     #logging.debug(type(drive_label))
     if drive_label.strip() == "Empty":
@@ -65,21 +71,24 @@ def get_tape_labels(changer):
     logging.info(tapelabels)
     return tapelabels
 
-get_tape_labels(CHANGER)
 
-
-def change_tape(slotnum):
+def change_tape(changer, slotnum):
     """change tape in drive"""
-    result = subprocess.check_call(["mtx", "-f", CHANGERDEVICE, "load", str(slotnum)])
+    labels = get_tape_labels(changer)
+    if labels['Drive'] != None:
+        result = subprocess.check_call(["mtx", "-f", changer, "unload"])
+        time.sleep(60)
+    result = subprocess.check_call(["mtx", "-f", changer, "load", str(slotnum)])
     if result:
         script_fail("tape change failed")
         return result
+    logging.debug("MTX: %s", result)
     time.sleep(60)
-    #TODO: test if successful
+    #TODO: more checks
     return result
 
 
-def format_tape(tape, changer, ask_to_confirm=True):
+def format_tape(tapedevice, changer, tapeserial, ask_to_confirm=True):
     """format tape in drive with LTFS"""
     #alias mkltfs-loader2='mkltfs --device=/dev/tape/by-id/scsi-3500507631211505c-nst
     # --rules="size=500K/name=indexfile.txt"'
@@ -88,45 +97,59 @@ def format_tape(tape, changer, ask_to_confirm=True):
     command_path = "/opt/QUANTUM/ltfs/bin/"
     command = "mkltfs"
     format_rules = "size=500K/name=indexfile.txt"
-    print(format_rules)
+    logging.debug(format_rules)
     #confirm formatting
-    loaded_tape = get_tape_label(changer)
+    loaded_tapes = get_tape_labels(changer)
+    if loaded_tapes['Drive'] is None:
+        raise TapeError('Error formatting tape: No tape in drive')
     if ask_to_confirm is True:
-        confirm = yes_or_no("FORMAT tape labeled " + loaded_tape + " to LTFS, serial " + tape + "?")
+        confirm = yes_or_no("FORMAT tape labeled " + loaded_tapes['Drive'] + " to LTFS, serial " + tapeserial + "?")
         if confirm is True:
             result = subprocess.check_call([command_path+command, "-d",
-                                            TAPEDEVICE, "-r", format_rules, "-s", tape, "-n", tape])
+                                            tapedevice, "-r", format_rules, "-s", tapeserial, "-n", tapeserial])
         else:
             print("formatting cancelled by user")
             script_fail(errormsg="formatting cancelled")
     else:
         try:
+            logging.info("Formatting tape to LTFS, barcode: %s serial: %s", loaded_tapes['Drive'], tapeserial)
             result = subprocess.check_call([command_path+command, "-d",
-                                            TAPEDEVICE, "-r", format_rules, "-s", tape, "-n", tape])
+                                            tapedevice, "-r", format_rules,
+                                            "-s", tapeserial, "-n", tapeserial])
+            if result != 0:
+                raise TapeError("Error formatting tape")
         except subprocess.CalledProcessError:
+            logging.warning("Error formatting tape")
             raise TapeError('Error formatting tape')
-    print(result)
+    logging.debug(result)
     return result
 
 
-def mount_tape(mountpoint):
+def mount_tape(tapedevice, mountpoint):
     #alias mountltfs-loader2='/opt/QUANTUM/ltfs/bin/ltfs-singledrive -o devname=/dev/tape/by-id/scsi-3500507631211505c-nst /mnt/ltfs-loader2'
     result = False
     command_path = "/opt/QUANTUM/ltfs/bin/"
-    command = "ltfs-singledrive" + ' -o devname=' + TAPEDEVICE + ' ' + mountpoint
+    command = "ltfs-singledrive" + ' -o devname=' + tapedevice + ' ' + mountpoint
+    logging.debug("mount command: %s", command)
     #check if mountpoint exits
+    mountpoint = pathlib.Path(mountpoint)
+    logging.debug("test")
     if not mountpoint.is_dir():
+        logging.error("Mount directory not found")
         raise TapeError('Mount directory not found')
     #check if mountpoint is not already mounted
-    if os.path.ismount(mountpoint):
+    logging.debug("test ismount")
+    #if os.path.ismount(mountpoint): python 3.6
+    if os.path.ismount(mountpoint.as_posix()): #python 3.4
         raise TapeError('Mount directory already mounted ?')
     try:
         result = subprocess.check_call(command_path+command, shell=True)
+        logging.debug("mount result: %s", result)
     except subprocess.CalledProcessError:
         raise TapeError('Error mounting tape')
     #result.c
     #check if mountpoint is mounted
-    if os.path.ismount(mountpoint):
+    if os.path.ismount(mountpoint.as_posix()):
         return mountpoint
     else:
         raise TapeError('Error while mounting tape')
@@ -135,32 +158,56 @@ def mount_tape(mountpoint):
 def unmount_tape(mountpoint):
     if not os.path.ismount(mountpoint):
         raise TapeError('Mount directory not mounted ?')
-        command = "umount " + mountpoint
-        try:
-            result = subprocess.check_call(command, shell=True)
-        except subprocess.CalledProcessError:
-            raise TapeError('Error mounting tape')
+    command = "umount " + mountpoint
+    try:
+        result = subprocess.check_call(command, shell=True)
+    except subprocess.CalledProcessError:
+        raise TapeError('Error mounting tape')
+
+def get_tape_free(mountpoint):
+    """return free space on tape (bytes)"""
+    if not os.path.ismount(mountpoint):
+        raise TapeError('tape not mounted ?')
+    try:
+        stats = os.statvfs(mountpoint)
+    except:
+        raise TapeError('can not get free space on mounted tape')
+    free_space = stats[0] * stats[3]
+    return free_space
 
 
-if __name__ == 'main':
-
-    NUM_DRIVES = 1
-    NUM_PRODUCERS = 4
+class TapeServer(Protocol):
+    def __init__(self, factory):
+        self.factory = factory
+        logger.debug("Starting tape_daemon")
+        config = ConfigObj('/etc/tape_daemon.conf')
     
-    logger = logging.Logger(__name__)
+        self.TAPEDEVICE = config['tapedevice']
+        self.CHANGERDEVICE = config['changerdevice']
+        self.LTFSMOUNTPOINT = config['ltfsmountpoint']
+
+    def connectionMade(self):
+        self.factory.numProtocols = self.factory.numProtocols + 1
+        self.transport.write(
+            "Tape Daemon:\n")
+
+    def dataReceived(self, data):
+        pass
+
+class TapeServerFactory(Factory):
+    def buildProtocol(self, addr):
+        return TapeServer()
+        
+if __name__ == '__main__':
+    
+    logger = logging.getLogger('tape daemon')
+    #logger = logging.Logger('root':{'handlers':('console', 'file'), 'level':'DEBUG'})
+    #logger = logging.Logger(__name__)
     logging.basicConfig(level=logging.DEBUG)
+    logger.setLevel(logging.DEBUG)
 
-    logger.debug("Starting tape_daemon")    
-    config = ConfigObj('/etc/tape_daemon.conf')
-
-    TAPEDEVICE = config['tapedevice']
-    CHANGERDEVICE = config['changerdevice']
-    LTFSMOUNTPOINT = config['ltfsmountpoint']
-    iq = IterableQueue()
-    
-    consumer_endpoint = iq.get_consumer()
-    p = Process(target=consumer_func, args=(consumer_endpoint, 0))
-    
-    iq.close()
-    test = get_tape_label(CHANGERDEVICE)
-    print(test)
+    logging.debug("creating endpoint")
+    endpoint = TCP4ServerEndpoint(reactor, 8601)
+    endpoint.listen(TapeServerFactory())
+    logging.debug("running reactor")
+    reactor.run()
