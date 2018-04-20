@@ -2,18 +2,22 @@
 # 2018 Daniel R. Rudolph for EMA group at research center caesar, Bonn
 
 import os
+import argparse
 import sys
 import time
 import datetime
-import pwd
 import pathlib
 import collections
 import logging
 from pathlib import Path
 import shutil
+import pwd
 import io
 import hashlib
+import queue
+import shelve
 
+import inotify
 import bagit
 from configobj import ConfigObj
 import inotify.adapters
@@ -22,17 +26,45 @@ from daemonize import Daemonize
 
 from util import get_dir_size
 
-#class FrameDataset:
-#    def __init__(self, path):
-#        self.path = path
-#        self.uid = 0
-#        self.gid = 0
-#        self.tapes = []
+#Testdata = collections.namedtuple('FrameDataset',
+#                                  ['path', 'username', 'uid', 'gid',
+#                                   'bagged', 'tapes'])
 
-Testdata = collections.namedtuple('FrameDataset',
-                                  ['path', 'username', 'uid', 'gid',
-                                   'bagged', 'tapes'])
+class FrameDataset():
 
+    def __init__(self, path=None, username=None, uid=None, gid=None, 
+              bagged=None, tapes=None):
+        self.path = path
+        self.username = username
+        self.uid = uid
+        self.gid = gid
+        self.bagged = bagged
+        self.tapes = tapes
+
+
+def get_userdata_from_path(pathname):
+    logging.debug("get_userdata_from_path: %s", pathname)
+    try:
+        username = pathname.name.split('-')[3]
+    except IndexError: 
+        username = None
+        logging.warning("can't get username from path %s", pathname.name )
+        return (None, None, None)
+    try:
+        if username != None:  uid = pwd.getpwnam(username).pw_uid
+    except (IndexError, KeyError):
+        uid = None
+        logging.warning("can't get uid from path %s", pathname )
+    try:
+        if username != None:  gid = pwd.getpwnam(username).pw_gid
+    except (IndexError, KeyError):
+        gid = None
+        logging.warning("can't get gid from path %s", pathname )
+    logging.debug("uid: %s", uid)
+    logging.debug("gid: %s", gid)
+    logging.debug("username: %s", username)
+    return (username, uid, gid)
+       
 
 def lock_directory(path):
     #TODO
@@ -46,12 +78,10 @@ def unlock_directory(path):
 
 def adjust_dir_permissions(path):
     '''change user and permissions according to username in dir name'''
-    username = path.name.split('-')[3]
-    logging.debug("username: %s", username)
-    uid = pwd.getpwnam(username).pw_uid
-    gid = pwd.getpwnam(username).pw_gid
-    logging.debug("uid: %s", uid)
-    logging.debug("gid: %s", gid)
+    username, uid, gid = get_userdata_from_path(path)
+    #username = path.name.split('-')[3]
+    #uid = pwd.getpwnam(username).pw_uid
+    #gid = pwd.getpwnam(username).pw_gid
     #https://stackoverflow.com/questions/2853723/what-is-the-python-way-for-recursively-setting-file-permissions
     for root, dirs, files in os.walk(path):
         for d in dirs:
@@ -72,7 +102,8 @@ def create_bag(dataset):
 
 class HashTransparentFile():
     """based on https://stackoverflow.com/questions/14014854/python-on-the-fly-md5-as-one-reads-a-stream"""
-    def __init__(self, source, hashlist):
+    """stream file from remote fs, calculate checksum on the fly"""
+    def __init__(self, source, bufsize, hashlist):
         self.hashlist = hashlist
         self._sigmd5 = hashlib.md5()
         self._sigsha1 = hashlib.sha1()
@@ -80,10 +111,10 @@ class HashTransparentFile():
         self._sigsha512 = hashlib.sha512()
         self._source = source
 
-    def read(self, buffer):
+    def read(self, bufsize):
         # we ignore the buffer size, just use the `.next()` value in the source iterator
         try:
-            line = self._source.next()
+            line = self._source.read()
             
             #TODO: only calculate requested
             self._sigmd5.update(line)
@@ -108,9 +139,35 @@ class HashTransparentFile():
         return hashes
 
 
-def copy_dataset(dataset, chunksize, hashlist):
+def copy_dataset(dataset, dstpath, chunksize, hashlist, retries=1):
     for file in dataset.list:
-        hashed = HashTransparentFile(file.iter_content(chunksize), hashlist)
+        #srcfile = 
+        #dstfile = 
+        hashed = HashTransparentFile(srcfile, chunksize, hashlist)
+        shutil.copyfileobj(hashed, dstfile, chunksize)
+        #compare hashes:
+        #retransmit if mismatch
+
+
+start=time.time()
+testfile=open('/home/daniel/d8323ewghs_labfolder_mpi_v_1.16.3.zip', 'br')
+dstfile=open('/tmp/dst-test', 'bw')
+shutil.copyfileobj(testfile, dstfile, 400000000)
+testfile.close()
+dstfile.close()
+end=time.time()
+t1=end-start
+
+
+start=time.time()
+testfile=open('/home/daniel/d8323ewghs_labfolder_mpi_v_1.16.3.zip', 'br')
+dstfile=open('/tmp/dst-test', 'bw')
+hashed = HashTransparentFile(testfile, 'sha256')
+shutil.copyfileobj(hashed, dstfile, 400000000)
+testfile.close()
+dstfile.close()
+end=time.time()
+t2=end-start
 
 
 #def process_dir(path, msize, move=False):
@@ -159,7 +216,6 @@ def copy_dataset(dataset, chunksize, hashlist):
 #            #case: several subdirs, all smaller than msize, pack subdirs
 #            else:
 #                bins = binpacking.to_constant_volume(smalldirs, msize)
-
 
 
 
@@ -229,7 +285,7 @@ def split_bag(bag, msize, copy=True, mode='Simple'):
 
 
 
-def copy_to_tape(dataset):
+def copy_to_tape(bag):
     pass
 
 
@@ -237,18 +293,18 @@ def validate_tape(path):
     pass
 
 
-@Celery.task(name='workers.watch_dir')
-def watch_dir(path):
-    i = inotify.adapters.Inotify(path)
-    #try:
-    for event in i.event_gen():
-        if event is not None:
-            (header, type_names, watch_path, filename) = event
-            logger.info("WD=(%d) MASK=(%d) COOKIE=(%d) LEN=(%d) MASK->NAMES=%s " "WATCH-PATH=[%s] FILENAME=[%s]",
-            header.wd, header.mask, header.cookie, header.len, type_names,
-            watch_path.decode('utf-8'), filename.decode('utf-8'))
-            print(event)
-            #adjust_dir_permissions(event)
+#@Celery.task(name='workers.watch_dir')
+#def watch_dir(path):atasets
+#    i = inotify.adapters.Inotify(path)
+#    #try:
+#    for event in i.event_gen():
+#        if event is not None:
+#            (header, type_names, watch_path, filename) = event
+#            logger.info("WD=(%d) MASK=(%d) COOKIE=(%d) LEN=(%d) MASK->NAMES=%s " "WATCH-PATH=[%s] FILENAME=[%s]",
+#            header.wd, header.mask, header.cookie, header.len, type_names,
+#            watch_path.decode('utf-8'), filename.decode('utf-8'))
+#            print(event)
+#            #adjust_dir_permissions(event)
 
 
 
@@ -286,7 +342,6 @@ def archiver():
         else:
             logging.warn("found malformed directory name:%s", d)
     print(dir_names)
-
     for path in dir_names:
         adjust_dir_permissions(path)
 
@@ -295,6 +350,10 @@ def archiver():
 
 if __name__ == "__main__":
 
+    parser = argparse.ArgumentParser(description='EMA Frame Archiver')
+    parser.add_argument('-d', '--daemonize', action='store_true', 
+                        help="run as daemon")
+    args = parser.parse_args()
     
     app = Celery('watch_dir', backend='rpc://', broker='pyamqp://')
     app.config_from_object('celeryconfig')
@@ -325,25 +384,47 @@ if __name__ == "__main__":
     INTERVAL = config.as_int('interval')
 
 
-
     #TODO: Error checking
-    FRAME_DIR = pathlib.PosixPath(FRAME_DIR).resolve()
-    ARCHIVE_DIR = pathlib.PosixPath(ARCHIVE_DIR).resolve()
+    FRAME_DIR_PATH = pathlib.PosixPath(FRAME_DIR).resolve()
+    ARCHIVE_DIR_PATH = pathlib.PosixPath(ARCHIVE_DIR).resolve()
 
-    run_as_daemon = False
-    if run_as_daemon == True:
+
+    #bagging = queue.Queue()
+    bagging = collections.deque()
+    copying = queue.Queue()
+
+    #run_as_daemon = False
+    if args.daemonize == True:
         
         daemon = Daemonize(app="frame_archive", pid=pid,
                            action=archiver, keep_fds=keep_fds, logger=logger,
                            verbose=True, foreground=True)
+        
+        i = inotify.adapters.Inotify()
+        i.add_watch(FRAME_DIR)
+        
         daemon.start()
-        while True:
-            halt = False
+        #while True:
+        halt = False
             
         while not halt:
-            print("testing")
-            time.sleep(5)
-            time.sleep(INTERVAL)
+            logging.debug("starting daemon")
+            #time.sleep(5)
+            events = i.event_gen(yield_nones=False, timeout_s=1)
+            #time.sleep(INTERVAL)
+            events = list(events)
+            for event in events:
+                if 'IN_CREATE' in event[1]:
+                    logging.debug(event)
+                    newdir = pathlib.PosixPath(event[2]).joinpath(pathlib.PosixPath(event[3]))
+                    username, uid, gid = get_userdata_from_path(newdir)
+                    if username is not None and uid is not None and gid is not None:
+                        d = FrameDataset(path=newdir, username=username, uid=uid, gid=gid, bagged=False, tapes=None)
+                        logging.debug("adding dataset: %s", d)
+                        bagging.append(d)
+                        with shelve.open('bagging.shelf') as bagging_shelf:
+                            bagging_shelf['bagging'] = bagging
+            logging.debug("inotify events: %s",events)
 
     else:
         #run once
