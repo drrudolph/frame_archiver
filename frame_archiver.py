@@ -30,18 +30,31 @@ from util import get_dir_size
 #                                  ['path', 'username', 'uid', 'gid',
 #                                   'bagged', 'tapes'])
 
-class FrameDataset():
+class FrameDataset(bagit.Bag):
 
     def __init__(self, path=None, username=None, uid=None, gid=None, 
               bagged=None, tapes=None):
-        self.path = path
+        #self.path = path
         self.username = username
         self.uid = uid
         self.gid = gid
         self.bagged = bagged
         self.tapes = tapes
-
-
+        
+        # for parent class
+        super().__init__(path)
+#        self.tags = {}
+#        self.info = {}
+#        self.entries = {}
+#        self.normalized_filesystem_names = {}
+#        self.normalized_manifest_names = {}
+#        self.algorithms = []
+#        self.tag_file_name = None
+#        #self.version_info = None
+#        #self.path = str(path.absolute())
+#        self.path = os.path.abspath(path)
+        
+     
 def get_userdata_from_path(pathname):
     logging.debug("get_userdata_from_path: %s", pathname)
     try:
@@ -101,8 +114,8 @@ def create_bag(dataset):
 
 
 class HashTransparentFile():
-    """based on https://stackoverflow.com/questions/14014854/python-on-the-fly-md5-as-one-reads-a-stream"""
-    """stream file from remote fs, calculate checksum on the fly"""
+    """based on https://stackoverflow.com/questions/14014854/python-on-the-fly-md5-as-one-reads-a-stream
+    stream file from remote fs, calculate checksum on the fly"""
     def __init__(self, source, bufsize, hashlist):
         self.hashlist = hashlist
         self._sigmd5 = hashlib.md5()
@@ -110,6 +123,7 @@ class HashTransparentFile():
         self._sigsha256 = hashlib.sha256()
         self._sigsha512 = hashlib.sha512()
         self._source = source
+        self.bufsize = bufsize
 
     def read(self, bufsize):
         # we ignore the buffer size, just use the `.next()` value in the source iterator
@@ -139,46 +153,79 @@ class HashTransparentFile():
         return hashes
 
 
-def copy_dataset(dataset, dstpath, chunksize, hashlist, retries=1):
-    for file in dataset.list:
-        #srcfile = 
-        #dstfile = 
-        hashed = HashTransparentFile(srcfile, chunksize, hashlist)
-        shutil.copyfileobj(hashed, dstfile, chunksize)
+def copy_dataset(dataset, srcpath, dstpath, chunksize, hashlist, retries=1):
+    #TODO: put srcpath in class
+    #sanity checks
+    dstpath = pathlib.PosixPath(dstpath)
+    #dstpath = dstpath.resolve(strict=True)
+    if dstpath.exists() and dstpath.is_dir() is False:
+        raise NotADirectoryError
+    if os.access(dstpath.parent, os.W_OK | os.X_OK) is False:
+        raise PermissionError
+        
+    for srcfilename in dataset.entries.keys():
+        srcfilename = pathlib.PosixPath(srcfilename)
+        srcfilename = srcpath.joinpath(pathlib.PosixPath(srcfilename))
+        logging.debug("srcfilename: %s", srcfilename)
+        relpath = srcfilename.relative_to(srcpath)
+        logging.debug("relpath: %s", relpath)
+        dst = dstpath.joinpath(relpath)
+        #dstfilename = dstpath.joinpath(os.path.basename(srcfilename))
+        logging.debug("filename: %s", srcfilename)
+        
+        if not dst.parent.exists():
+            logging.debug("creating %s", dst.parent)
+            dst.parent.mkdir(parents=True)
+        if srcfilename.is_file() is True:
+            with open(srcfilename, 'br') as srcfile, open(dst, 'bw+') as dstfile:
+#                logging.debug("srcfile: %s", srcfile)
+#                logging.debug("dstfile: %s", dstfile)
+#                logging.debug("chunksize: %s", chunksize)
+#                logging.debug("hashlist: %s", hashlist)
+                hashed = HashTransparentFile(srcfile, chunksize, hashlist)
+                logging.info("copying %s to %s", srcfile, dstfile)
+                shutil.copyfileobj(hashed, dstfile, chunksize)
+                copyhashes = hashed.hexdigest()
+        else:
+            raise TypeError("Not a file")
         #compare hashes:
+        logging.debug(copyhashes)
+        if srcfile in dataset.entries.keys():
+            if copyhashes['sha256'] == dataset.entries[srcfilename]:
+                logging.debug("hash ok:%s %s", copyhashes['sha256'], dataset.entries[srcfilename])
         #retransmit if mismatch
 
 
-start=time.time()
-testfile=open('/home/daniel/d8323ewghs_labfolder_mpi_v_1.16.3.zip', 'br')
-dstfile=open('/tmp/dst-test', 'bw')
-shutil.copyfileobj(testfile, dstfile, 400000000)
-testfile.close()
-dstfile.close()
-end=time.time()
-t1=end-start
+#start=time.time()
+#testfile=open('/home/daniel/d8323ewghs_labfolder_mpi_v_1.16.3.zip', 'br')
+#dstfile=open('/tmp/dst-test', 'bw')
+#shutil.copyfileobj(testfile, dstfile, 400000000)
+#testfile.close()
+#dstfile.close()
+#end=time.time()
+#t1=end-start
+#
+#
+#start=time.time()
+#testfile=open('/home/daniel/d8323ewghs_labfolder_mpi_v_1.16.3.zip', 'br')
+#dstfile=open('/tmp/dst-test', 'bw')
+#hashed = HashTransparentFile(testfile, 'sha256')
+#shutil.copyfileobj(hashed, dstfile, 400000000)
+#testfile.close()
+#dstfile.close()
+#end=time.time()
+#t2=end-start
 
 
-start=time.time()
-testfile=open('/home/daniel/d8323ewghs_labfolder_mpi_v_1.16.3.zip', 'br')
-dstfile=open('/tmp/dst-test', 'bw')
-hashed = HashTransparentFile(testfile, 'sha256')
-shutil.copyfileobj(hashed, dstfile, 400000000)
-testfile.close()
-dstfile.close()
-end=time.time()
-t2=end-start
-
-
-#def process_dir(path, msize, move=False):
-#    """split dir into several dirs with msize (MB), simple splitting,
+#def process_dir(path,maxsize, move=False):
+#    """split dir into several dirs withmaxsize (MB), simple splitting,
 #        returns number of chunks"""
-#    msize = msize*1024*1024
+#   maxsize =maxsize*1024*1024
 #    #total is small enough
-#    if os.path.getsize(path) < msize:
+#    if os.path.getsize(path) <maxsize:
 #            return 1
 #    else:
-#        #find all subdirs larger than msize
+#        #find all subdirs larger thanmaxsize
 #        largedirs = []
 #        smalldirs = []
 #        bags = []
@@ -188,7 +235,7 @@ t2=end-start
 #            for entry in subdirs:
 #                if entry.is_dir():
 #                    entrysize = os.path.getsize(entry)
-#                    if entrysize + current_size <= msize:
+#                    if entrysize + current_size <=maxsize:
 #                        current_bag.append(entry)
 #                        current_size += os.path.getsize(entry)
 #                    else: 
@@ -199,7 +246,7 @@ t2=end-start
 #
 #                        
 ##                    try:
-##                        if os.path.getsize(subdir) > msize:
+##                        if os.path.getsize(subdir) >maxsize:
 ##                            largedirs.append(subdir)
 ##                        else:
 ##                           smalldirs.append(subdir) 
@@ -210,22 +257,21 @@ t2=end-start
 #            if len(largedirs) == 1:
 #                for entry in os.scandir(largedirs[0]):
 #                    #process_dir rekursiv ?
-#            #case: several subdirs, at least one larger than msize
+#            #case: several subdirs, at least one larger thanmaxsize
 #            elif len(largedirs) > 1:
 #                
-#            #case: several subdirs, all smaller than msize, pack subdirs
+#            #case: several subdirs, all smaller thanmaxsize, pack subdifilers
 #            else:
-#                bins = binpacking.to_constant_volume(smalldirs, msize)
+#                bins = binpacking.to_constant_volume(smalldirs,maxsize)
 
 
-
-def split_bag(bag, msize, copy=True, mode='Simple'):
-    """split bag into several bags with max size msize (MB), simple splitting,
+def split_bag(bag,maxsize, copy=True, mode='Simple'):
+    """split bag into several bags with max size maxsize (MB), simple splitting,
         returns list of bags
         """
-    #msize = msize*1024*1024
+    #msize = maxsize*1024*1024
     #total is small enough
-    if get_dir_size(bag.path) <= msize:
+    if get_dir_size(bag.path) <= maxsize:
         bags = [bag]
     else:
         if mode == 'Simple':
@@ -240,7 +286,7 @@ def split_bag(bag, msize, copy=True, mode='Simple'):
                 #logger.debug(itempath, itemsize)
                 print("itempath, itemsize:", itempath, itemsize)
 
-                if (itemsize + current_size) <= msize:
+                if (itemsize + current_size) <= maxsize:
                     print("current_size before", current_size)
                     print("appending ", item)
                     current_bag.append(itempath)
@@ -280,7 +326,8 @@ def split_bag(bag, msize, copy=True, mode='Simple'):
                 shutil.copy2(orig_path.joinpath(file), new_bag_path.joinpath(file))
 
         bags = splits
-
+        for split_dir in bags:
+            create_bag(split_dir)
     return bags
 
 
@@ -420,6 +467,7 @@ if __name__ == "__main__":
                     username, uid, gid = get_userdata_from_path(newdir)
                     if username is not None and uid is not None and gid is not None:
                         d = FrameDataset(path=newdir, username=username, uid=uid, gid=gid, bagged=False, tapes=None)
+                        adjust_dir_permissions(newdir)
                         logging.debug("adding dataset: %s", d)
                         bagging.append(d)
                         with shelve.open('bagging.shelf') as bagging_shelf:
